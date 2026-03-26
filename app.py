@@ -1,6 +1,9 @@
 import io
 import re
 from pathlib import Path
+import zipfile
+import tempfile
+import os
 
 import numpy as np
 import pandas as pd
@@ -43,6 +46,8 @@ def normalize_name(name: str) -> str:
     stem = re.sub(r"\s+", " ", stem)
     return stem
 
+def is_zip_upload(uploaded_file):
+    return Path(uploaded_file.name).suffix.lower() == ".zip"
 
 def read_text_lines(uploaded_file):
     try:
@@ -55,7 +60,6 @@ def read_text_lines(uploaded_file):
     else:
         text = str(raw)
     return text.splitlines()
-
 
 def parse_nmr_file(uploaded_file):
     """
@@ -112,6 +116,101 @@ def parse_nmr_file(uploaded_file):
 
     return x, y, delimiter
 
+def read_bruker_text_from_zip(zf, member_name):
+    with zf.open(member_name) as f:
+        return f.read().decode("utf-8", errors="replace")
+
+
+def find_first_matching_member(names, target_suffix):
+    for n in names:
+        if n.endswith(target_suffix):
+            return n
+    return None
+
+
+def parse_bruker_param(text, key):
+    """
+    Extracts Bruker parameters like:
+    ##$OFFSET= 12.345
+    ##$SW_p= 8012.8205
+    ##$SF= 400.1324706
+    ##$SI= 65536
+    """
+    pattern = rf"##\${re.escape(key)}=\s*(.+)"
+    m = re.search(pattern, text)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+
+    # take first token if there are extras
+    token = raw.split()[0]
+    try:
+        return float(token)
+    except Exception:
+        return raw
+
+
+def parse_bruker_zip(uploaded_file):
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    with zipfile.ZipFile(uploaded_file, "r") as zf:
+        names = zf.namelist()
+
+        member_1r = find_first_matching_member(names, "pdata/1/1r")
+        member_procs = find_first_matching_member(names, "pdata/1/procs")
+        member_proc = find_first_matching_member(names, "pdata/1/proc")
+        member_title = find_first_matching_member(names, "pdata/1/title")
+
+        if member_1r is None:
+            raise ValueError("Could not find pdata/1/1r inside the zip.")
+
+        if member_procs is None and member_proc is None:
+            raise ValueError("Could not find pdata/1/procs or pdata/1/proc inside the zip.")
+
+        procs_text = ""
+        if member_procs is not None:
+            procs_text += read_bruker_text_from_zip(zf, member_procs) + "\n"
+        if member_proc is not None:
+            procs_text += read_bruker_text_from_zip(zf, member_proc) + "\n"
+
+        # Bruker processed spectrum is usually int32 big-endian
+        with zf.open(member_1r) as f:
+            raw = f.read()
+
+        intensity = np.frombuffer(raw, dtype=">i4").astype(float)
+
+        si = parse_bruker_param(procs_text, "SI")
+        sf = parse_bruker_param(procs_text, "SF")
+        sw_p = parse_bruker_param(procs_text, "SW_p")
+        offset = parse_bruker_param(procs_text, "OFFSET")
+
+        if si is None:
+            si = len(intensity)
+        else:
+            si = int(si)
+
+        if len(intensity) != si:
+            intensity = intensity[:si]
+
+        if sf is None or sw_p is None or offset is None:
+            raise ValueError("Missing one or more required Bruker parameters: SF, SW_p, OFFSET.")
+
+        # spectral width in ppm
+        sw_ppm = float(sw_p) / float(sf)
+
+        # Bruker processed ppm axis:
+        # left edge at OFFSET, right edge at OFFSET - SW_ppm
+        ppm = np.linspace(float(offset), float(offset) - sw_ppm, si)
+
+        dataset_name = normalize_name(uploaded_file.name)
+        if member_title is not None:
+            title_text = read_bruker_text_from_zip(zf, member_title).strip()
+            if title_text:
+                dataset_name = normalize_name(title_text)
+
+        return dataset_name, ppm, intensity
 
 def build_review_table(uploaded_files):
     rows = []
@@ -121,19 +220,38 @@ def build_review_table(uploaded_files):
     for f in uploaded_files:
         dataset = normalize_name(f.name)
         try:
-            ppm, intensity, delimiter = parse_nmr_file(f)
-            parsed[dataset] = {
-                "ppm": ppm,
-                "intensity": intensity,
-                "source_file": f.name,
-                "delimiter": delimiter,
-            }
-            rows.append({
-                "Dataset": dataset,
-                "Points": len(ppm),
-                "Min ppm": float(np.min(ppm)),
-                "Max ppm": float(np.max(ppm)),
-            })
+            if is_zip_upload(f):
+                dataset_name, ppm, intensity = parse_bruker_zip(f)
+                parsed[dataset_name] = {
+                    "ppm": ppm,
+                    "intensity": intensity,
+                    "source_file": f.name,
+                    "format": "bruker_zip",
+                }
+                rows.append({
+                    "Dataset": dataset_name,
+                    "Format": "Bruker zip",
+                    "Points": len(ppm),
+                    "Min ppm": float(np.min(ppm)),
+                    "Max ppm": float(np.max(ppm)),
+                })
+            else:
+                ppm, intensity, delimiter = parse_nmr_file(f)
+                parsed[dataset] = {
+                    "ppm": ppm,
+                    "intensity": intensity,
+                    "source_file": f.name,
+                    "delimiter": delimiter,
+                    "format": "text_export",
+                }
+                rows.append({
+                    "Dataset": dataset,
+                    "Format": "Text export",
+                    "Points": len(ppm),
+                    "Min ppm": float(np.min(ppm)),
+                    "Max ppm": float(np.max(ppm)),
+                })
+
         except Exception as e:
             warnings.append({
                 "Dataset": dataset,
@@ -339,8 +457,8 @@ with left:
     st.subheader("Inputs")
 
     uploaded_files = st.file_uploader(
-        "1. Drop NMR export files",
-        type=["asc", "txt", "dat", "csv"],
+        "1. Drop zipped Bruker NMR export files",
+        type=["zip", "asc", "txt", "dat", "csv"],
         accept_multiple_files=True,
         key="nmr_uploaded_files",
     )
