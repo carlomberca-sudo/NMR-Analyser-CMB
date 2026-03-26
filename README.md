@@ -1,6 +1,6 @@
-# PLQY Streamlit App
+# NMR Streamlit App
 
-A private Streamlit app for PLQY analysis.
+A private Streamlit app for NMR analysis.
 
 ## Files
 - `app.py` - main app
@@ -13,13 +13,6 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
-```
-
-## Optional password protection on Streamlit Cloud
-In Streamlit app settings, add a secret:
-
-```toml
-app_password = "your-password-here"
 ```
 
 If no secret is configured, the app will still run locally without a password.
