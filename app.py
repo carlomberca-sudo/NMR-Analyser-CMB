@@ -176,16 +176,43 @@ def parse_bruker_zip(uploaded_file):
             procs_text += read_bruker_text_from_zip(zf, member_proc) + "\n"
 
         # Bruker processed spectrum is usually int32 big-endian
-        with zf.open(member_1r) as f:
-            raw = f.read()
-
-        intensity = np.frombuffer(raw, dtype=">i4").astype(float)
 
         si = parse_bruker_param(procs_text, "SI")
         sf = parse_bruker_param(procs_text, "SF")
         sw_p = parse_bruker_param(procs_text, "SW_p")
         offset = parse_bruker_param(procs_text, "OFFSET")
+        bytordp = parse_bruker_param(procs_text, "BYTORDP")
+        dtypp = parse_bruker_param(procs_text, "DTYPP")
 
+        with zf.open(member_1r) as f:
+            raw = f.read()
+
+
+        if dtypp is None:
+            dtypp = 0
+        if bytordp is None:
+            bytordp = 0
+
+        byteorder = ">" if int(bytordp) == 1 else "<"
+
+        if int(dtypp) == 2:
+            dtype = np.dtype(f"{byteorder}f8")
+        else:
+            dtype = np.dtype(f"{byteorder}i4")
+
+        intensity = np.frombuffer(raw, dtype=dtype).astype(float)
+        if len(intensity) == 0:
+            raise ValueError("Decoded spectrum is empty.")
+
+        if not np.all(np.isfinite(intensity)):
+            raise ValueError("Decoded spectrum contains non-finite values.")
+
+        if np.max(np.abs(intensity)) > 1e12:
+            raise ValueError(
+                f"Decoded spectrum values are unrealistically large "
+                f"(min={np.min(intensity):.3g}, max={np.max(intensity):.3g}). "
+                f"Likely wrong dtype/byte order."
+            )
         if si is None:
             si = len(intensity)
         else:
@@ -210,6 +237,20 @@ def parse_bruker_zip(uploaded_file):
             if title_text:
                 dataset_name = normalize_name(title_text)
 
+        st.write("Bruker parsing debug:", {
+            "dataset": dataset_name,
+            "SI": si,
+            "SF": sf,
+            "SW_p": sw_p,
+            "OFFSET": offset,
+            "BYTORDP": bytordp,
+            "DTYPP": dtypp,
+            "dtype": str(dtype),
+            "points": len(intensity),
+            "min_intensity": float(np.min(intensity)),
+            "max_intensity": float(np.max(intensity)),
+        })
+        
         return dataset_name, ppm, intensity
 
 def build_review_table(uploaded_files):
@@ -638,7 +679,7 @@ with right:
                     peaks_df=peaks_df,
                     display_range=display_range,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         with tab3:
             st.subheader("Peaks, integrals, and PDF export")
