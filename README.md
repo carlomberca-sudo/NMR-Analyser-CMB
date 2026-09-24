@@ -14,5 +14,4 @@ source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-If no secret is configured, the app will still run locally without a password.
+Application for processing and comparing NMR spectra, designed to simplify routine spectral analysis and provide a consistent workflow across measurements.
